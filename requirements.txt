@@ -1,0 +1,8 @@
+﻿numpy
+pandas
+pyyaml
+joblib
+tqdm
+deap
+scikit-learn==1.5.2
+setuptools<81

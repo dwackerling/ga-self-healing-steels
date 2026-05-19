@@ -1,0 +1,897 @@
+# surface_mc.py
+# ============================================================
+# Surface segregation module for the self-healing GA project
+# ============================================================
+#
+# Purpose
+# -------
+# Receive a bulk alloy composition in wt% and T_aging in °C,
+# run the multilayer Monte Carlo segregation model internally in K,
+# and return an effective surface composition in wt%.
+#
+# Design decisions for this project
+# ---------------------------------
+# - Input temperature from the GA is always in °C.
+# - Internal MC calculations use K.
+# - Fe is treated explicitly as the matrix/base element in the MC model.
+# - The effective surface composition is defined as the arithmetic
+#   mean over the 4 simulated atomic layers.
+# - Output is returned in wt%, both:
+#     (1) substitutional composition including Fe
+#     (2) solute-only composition excluding Fe
+# - Interstitials (C, B, N) are NOT considered in this module.
+# - Binary omega_nm values are loaded from a precomputed lookup table,
+#   avoiding repeated pycalphad calls inside the GA loop.
+#
+# This module does NOT:
+# - apply go/no-go logic
+# - compute DF_bulk or DF_surf
+# - call Thermo-Calc for precipitation driving force
+#
+# Those belong in go_nogo.py.
+# ============================================================
+
+from __future__ import annotations
+
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import json
+from pathlib import Path
+from typing import Dict, Tuple, List, Optional, Any
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+SURFACES_JSON_PATH = None
+OMEGA_TABLE_PATH = None
+
+PHASE_NAME = "BCC_A2"
+P_PA = 101325.0
+
+# Surface / geometry
+HKL = (1, 0, 0)
+A_BCC_M = 2.866e-10  # m
+
+# Segregation model
+L_LAYERS = 4
+
+# Monte Carlo defaults
+MC_STEPS = 10_000
+DELTA_MAX = 2e-2
+SEED_BASE = 0
+
+# Interaction extraction settings
+Z_BCC = 8
+LSQ_X_MIN = 0.05
+LSQ_X_MAX = 0.95
+LSQ_NPTS = 19
+
+# Numerical output rounding
+ROUND_DECIMALS = 6
+
+
+# ============================================================
+# INPUT TABLES
+# ============================================================
+
+MASAS = {
+    "CR": 51.996,
+    "AL": 26.982,
+    "NI": 58.693,
+    "NB": 92.906,
+    "MN": 54.938,
+    "SI": 28.085,
+    "FE": 55.845,
+    "W": 183.84,
+    "MO": 95.95,
+    "CU": 63.546,
+    "CO": 58.933,
+    "V": 50.942,
+    "TI": 47.867,
+}
+
+MATERIAL_IDS = {
+    "CR": "mp-90",
+    "FE": "mp-13",
+    "AL": "mp-134",
+    "NI": "mp-23",
+    "NB": "mp-75",
+    "MN": "mp-35",
+    "SI": "mp-149",
+    "W": "mp-91",
+    "CU": "mp-30",
+    "MO": "mp-129",
+    "V": "mp-146",
+    "TI": "mp-46",
+    "CO": "mp-54",
+}
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+R = 8.314  # J/mol/K
+N_A = 6.02214076e23
+
+
+# ============================================================
+# CACHES
+# ============================================================
+
+_SURF_DF_CACHE: Optional[pd.DataFrame] = None
+_OMEGA_TABLE_DF_CACHE: Optional[pd.DataFrame] = None
+_OMEGA_LOOKUP_CACHE: Optional[Dict[Tuple[int, str, str], float]] = None
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def _round_float(x: float, ndigits: int = ROUND_DECIMALS) -> float:
+    return round(float(x), ndigits)
+
+
+def _to_kelvin(T_celsius: float) -> float:
+    return float(T_celsius) + 273.15
+
+
+def _temperature_key_celsius(T_celsius: float) -> int:
+    """
+    Integer key for lookup in precomputed omega table.
+    The AG uses a discrete grid in °C, so exact integer lookup is appropriate.
+    """
+    return int(round(float(T_celsius)))
+
+
+# ============================================================
+# LOADERS
+# ============================================================
+
+def load_surface_energy_table(
+    surface_json_path: str | Path | None = SURFACES_JSON_PATH,
+    force_reload: bool = False,
+) -> pd.DataFrame:
+    global _SURF_DF_CACHE
+
+    if surface_json_path is None:
+        raise ValueError("surface_json_path must be provided.")
+
+    surface_json_path = Path(surface_json_path)
+
+    if force_reload or _SURF_DF_CACHE is None:
+        if not surface_json_path.exists():
+            raise FileNotFoundError(f"Surface JSON not found: {surface_json_path}")
+        with open(surface_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _SURF_DF_CACHE = pd.DataFrame(data)
+
+    return _SURF_DF_CACHE
+
+
+def load_omega_table(
+    omega_table_path: str | Path | None = OMEGA_TABLE_PATH,
+    force_reload: bool = False,
+) -> pd.DataFrame:
+    global _OMEGA_TABLE_DF_CACHE
+
+    if omega_table_path is None:
+        raise ValueError("omega_table_path must be provided.")
+
+    omega_table_path = Path(omega_table_path)
+
+    if force_reload or _OMEGA_TABLE_DF_CACHE is None:
+        if not omega_table_path.exists():
+            raise FileNotFoundError(f"Omega table not found: {omega_table_path}")
+        df = pd.read_csv(omega_table_path)
+
+        required = {
+            "phase",
+            "T_celsius",
+            "T_K",
+            "elem_a",
+            "elem_b",
+            "omega_Jmol",
+            "z_bcc",
+            "lsq_xmin",
+            "lsq_xmax",
+            "lsq_npts",
+        }
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"Omega table missing required columns: {sorted(missing)}")
+
+        df = df.copy()
+        df["phase"] = df["phase"].astype(str).str.upper()
+        df["elem_a"] = df["elem_a"].astype(str).str.upper()
+        df["elem_b"] = df["elem_b"].astype(str).str.upper()
+        df["T_celsius"] = df["T_celsius"].astype(int)
+
+        _OMEGA_TABLE_DF_CACHE = df
+
+    return _OMEGA_TABLE_DF_CACHE
+
+def build_omega_lookup(
+    omega_table_path: str | Path | None = OMEGA_TABLE_PATH,
+    force_reload: bool = False,
+) -> Dict[Tuple[int, str, str], float]:
+    """
+    Build lookup:
+        (T_celsius_int, elem_a_sorted, elem_b_sorted) -> omega_Jmol
+    """
+    global _OMEGA_LOOKUP_CACHE
+
+    if force_reload or _OMEGA_LOOKUP_CACHE is None:
+        df = load_omega_table(
+            omega_table_path=omega_table_path,
+            force_reload=force_reload,
+        )
+
+        lookup: Dict[Tuple[int, str, str], float] = {}
+
+        for _, row in df.iterrows():
+            a, b = sorted([str(row["elem_a"]).upper(), str(row["elem_b"]).upper()])
+            key = (int(row["T_celsius"]), a, b)
+            lookup[key] = float(row["omega_Jmol"])
+
+        _OMEGA_LOOKUP_CACHE = lookup
+
+    return _OMEGA_LOOKUP_CACHE
+
+# ============================================================
+# BCC GEOMETRY: Ω, z_l, z_v from (hkl)
+# ============================================================
+
+def _unit(vec):
+    vec = np.asarray(vec, dtype=float)
+    nrm = np.linalg.norm(vec)
+    if nrm == 0:
+        raise ValueError("Zero vector in unit().")
+    return vec / nrm
+
+
+def _bcc_primitive_vectors(a):
+    a1 = 0.5 * a * np.array([-1.0,  1.0,  1.0])
+    a2 = 0.5 * a * np.array([ 1.0, -1.0,  1.0])
+    a3 = 0.5 * a * np.array([ 1.0,  1.0, -1.0])
+    return np.stack([a1, a2, a3], axis=0)
+
+
+def _plane_two_shortest_translations_in_plane(hkl, a, search_N=30, tol=None):
+    h, k, l = hkl
+    n = _unit([h, k, l])
+    prim = _bcc_primitive_vectors(a)
+    if tol is None:
+        tol = 1e-12 * a
+
+    cand = []
+    for i in range(-search_N, search_N + 1):
+        for j in range(-search_N, search_N + 1):
+            for m in range(-search_N, search_N + 1):
+                if i == 0 and j == 0 and m == 0:
+                    continue
+                t = i * prim[0] + j * prim[1] + m * prim[2]
+                if abs(np.dot(n, t)) < tol:
+                    cand.append(t)
+
+    if len(cand) < 2:
+        raise RuntimeError("Too few in-plane vectors; increase search_N.")
+
+    cand = np.array(cand)
+    norms = np.linalg.norm(cand, axis=1)
+    cand = cand[np.argsort(norms)]
+    t1 = cand[0]
+
+    for t2 in cand[1:]:
+        area = np.linalg.norm(np.cross(t1, t2))
+        if area > 1e-12 * (np.linalg.norm(t1) * np.linalg.norm(t2)):
+            return t1, t2, area
+
+    raise RuntimeError("Could not find two independent in-plane translations.")
+
+
+def _bcc_nn_vectors(a):
+    s = [-1.0, 1.0]
+    vecs = []
+    for sx in s:
+        for sy in s:
+            for sz in s:
+                vecs.append(0.5 * a * np.array([sx, sy, sz]))
+    return np.array(vecs)
+
+
+def _zl_zv_from_nn(hkl, a, eps=None):
+    n = _unit(hkl)
+    nn = _bcc_nn_vectors(a)
+    if eps is None:
+        eps = 1e-12 * a
+    proj = nn @ n
+    zl = int(np.sum(np.abs(proj) < eps))
+    zv = int(np.sum(proj < -eps))
+    return zl, zv
+
+
+def bcc_plane_constants(hkl, a=A_BCC_M, search_N=30):
+    _, _, area_2d = _plane_two_shortest_translations_in_plane(hkl, a, search_N=search_N)
+    Omega = N_A * area_2d  # m^2/mol
+    zl, zv = _zl_zv_from_nn(hkl, a)
+    return float(Omega), int(zl), int(zv)
+
+
+# ============================================================
+# COMPOSITION TRANSFORMS
+# ============================================================
+
+def compute_fe_balance_wt(composition_wt: Dict[str, float]) -> float:
+    """
+    Compute Fe wt% as the substitutional balance to 100, excluding Fe itself.
+    Interstitials are not considered in this module.
+    """
+    total = 0.0
+    for el, val in composition_wt.items():
+        el_up = str(el).upper()
+        if el_up == "FE":
+            continue
+        total += float(val)
+    return _round_float(100.0 - total)
+
+
+def normalize_wt_full(composition_wt: Dict[str, float]) -> Dict[str, float]:
+    """
+    Build a full substitutional wt% composition including Fe balance.
+    Interstitials (C, B, N) are ignored in this module.
+    """
+    allowed_substitutional = {
+        "CR", "MN", "SI", "MO", "NI", "CU", "CO", "V", "NB", "W", "AL", "TI", "FE"
+    }
+
+    comp = {}
+    for k, v in composition_wt.items():
+        ku = str(k).upper()
+        if ku in allowed_substitutional:
+            comp[ku] = max(0.0, float(v))
+
+    if "FE" not in comp:
+        comp["FE"] = compute_fe_balance_wt(comp)
+
+    return {k: _round_float(v) for k, v in comp.items()}
+
+
+def wt_to_at_fraction(wt: np.ndarray, elems: List[str], masas: Dict[str, float]) -> np.ndarray:
+    """
+    Convert wt% vector to atomic fraction (0-1).
+    """
+    m = np.array([masas[e.upper()] for e in elems], dtype=float)
+    n = np.array(wt, dtype=float) / m
+    s = float(np.sum(n))
+    if s <= 0:
+        raise ValueError("Sum of moles <= 0 when converting to atomic fractions.")
+    return n / s
+
+
+def at_fraction_to_wt_fraction(at_frac: np.ndarray, elems: List[str], masas: Dict[str, float]) -> np.ndarray:
+    """
+    Convert atomic fraction (0-1) to weight fraction (0-1).
+    """
+    m = np.array([masas[e.upper()] for e in elems], dtype=float)
+    masses = np.array(at_frac, dtype=float) * m
+    s = float(np.sum(masses))
+    if s <= 0:
+        raise ValueError("Sum of masses <= 0 when converting to wt fractions.")
+    return masses / s
+
+
+def at_fraction_to_wt_percent(at_frac: np.ndarray, elems: List[str], masas: Dict[str, float]) -> np.ndarray:
+    """
+    Convert atomic fraction (0-1) to wt% (0-100).
+    """
+    return 100.0 * at_fraction_to_wt_fraction(at_frac, elems, masas)
+
+
+def build_mc_input_from_bulk_wt(composition_bulk_wt: Dict[str, float]) -> Tuple[List[str], np.ndarray, Dict[str, float]]:
+    """
+    Build MC input from substitutional wt% composition:
+    - explicit Fe as matrix/base
+    - only positive substitutional elements are included
+    - interstitials are ignored
+    - returns:
+        elements, wt_vec, normalized_substitutional_wt_dict
+    """
+    comp_full = normalize_wt_full(composition_bulk_wt)
+
+    elements_nonfe = [
+        el for el in MASAS.keys()
+        if el != "FE" and comp_full.get(el, 0.0) > 0.0
+    ]
+
+    fe_wt = float(comp_full.get("FE", 0.0))
+    if fe_wt < 0.0:
+        raise ValueError(f"Negative Fe balance: {fe_wt}")
+
+    elements = ["FE"] + elements_nonfe
+    wt_vec = np.array([fe_wt] + [float(comp_full[e]) for e in elements_nonfe], dtype=float)
+
+    if np.any(wt_vec < 0):
+        raise ValueError("Negative wt% detected in MC input.")
+
+    s = float(np.sum(wt_vec))
+    if not np.isfinite(s) or s <= 0:
+        raise ValueError("Invalid wt% sum in MC input.")
+    if abs(s - 100.0) > 1e-6:
+        wt_vec = 100.0 * wt_vec / s
+
+    return elements, wt_vec, comp_full
+
+
+# ============================================================
+# SURFACE ENERGIES gamma0 (J/m^2)
+# ============================================================
+
+def gamma0_vector_from_mp_ids(elements: List[str], surf_df: pd.DataFrame, material_ids: Dict[str, str]) -> np.ndarray:
+    gamma0 = []
+    for el in elements:
+        el_up = el.upper()
+        if el_up not in material_ids:
+            raise KeyError(f"Missing material_id for element {el_up}.")
+        mid = material_ids[el_up]
+        sel = surf_df.loc[surf_df["material_id"] == mid, "weighted_surface_energy"]
+        if sel.empty:
+            raise KeyError(f"weighted_surface_energy not found for {el_up} (material_id={mid}).")
+        if len(sel.values) != 1:
+            raise KeyError(f"Duplicate entries in surfaces.json for {el_up} (material_id={mid}).")
+        gamma0.append(float(sel.values[0]))
+    return np.array(gamma0, dtype=float)
+
+
+# ============================================================
+# OMEGA LOOKUP FROM PRECOMPUTED TABLE
+# ============================================================
+
+def omega_pair_lookup(
+    elem1: str,
+    elem2: str,
+    T_celsius: float,
+    phase: str = PHASE_NAME,
+    z_bcc: int = Z_BCC,
+    lsq_xmin: float = LSQ_X_MIN,
+    lsq_xmax: float = LSQ_X_MAX,
+    lsq_npts: int = LSQ_NPTS,
+    omega_table_path: str | Path | None = OMEGA_TABLE_PATH,
+) -> float:
+    """
+    Lookup precomputed omega_Jmol for a binary pair at a given T_celsius.
+    """
+    # Load full table to validate metadata once
+    df = load_omega_table(omega_table_path=omega_table_path)
+    lookup = build_omega_lookup(omega_table_path=omega_table_path)
+
+    t_key = _temperature_key_celsius(T_celsius)
+    a, b = sorted([str(elem1).upper(), str(elem2).upper()])
+
+    key = (t_key, a, b)
+    if key not in lookup:
+        raise KeyError(
+            f"Omega lookup missing for T_celsius={t_key}, pair=({a}, {b})."
+        )
+
+    # Optional metadata consistency check against first matching row
+    rows = df[
+        (df["T_celsius"] == t_key) &
+        (df["elem_a"] == a) &
+        (df["elem_b"] == b)
+    ]
+    if rows.empty:
+        rows = df[
+            (df["T_celsius"] == t_key) &
+            (df["elem_a"] == b) &
+            (df["elem_b"] == a)
+        ]
+    if rows.empty:
+        raise KeyError(
+            f"Omega metadata row missing for T_celsius={t_key}, pair=({a}, {b})."
+        )
+
+    row = rows.iloc[0]
+    if str(row["phase"]).upper() != str(phase).upper():
+        raise ValueError(
+            f"Omega table phase mismatch for ({a}, {b}) at {t_key} °C: "
+            f"table={row['phase']} requested={phase}"
+        )
+    if int(row["z_bcc"]) != int(z_bcc):
+        raise ValueError(
+            f"Omega table z_bcc mismatch for ({a}, {b}) at {t_key} °C: "
+            f"table={row['z_bcc']} requested={z_bcc}"
+        )
+    if abs(float(row["lsq_xmin"]) - float(lsq_xmin)) > 1e-12:
+        raise ValueError(
+            f"Omega table lsq_xmin mismatch for ({a}, {b}) at {t_key} °C."
+        )
+    if abs(float(row["lsq_xmax"]) - float(lsq_xmax)) > 1e-12:
+        raise ValueError(
+            f"Omega table lsq_xmax mismatch for ({a}, {b}) at {t_key} °C."
+        )
+    if int(row["lsq_npts"]) != int(lsq_npts):
+        raise ValueError(
+            f"Omega table lsq_npts mismatch for ({a}, {b}) at {t_key} °C."
+        )
+
+    return float(lookup[key])
+
+
+def omega_matrix_for_elements_from_table(
+    elements: List[str],
+    T_celsius: float,
+    phase: str = PHASE_NAME,
+    z_bcc: int = Z_BCC,
+    lsq_xmin: float = LSQ_X_MIN,
+    lsq_xmax: float = LSQ_X_MAX,
+    lsq_npts: int = LSQ_NPTS,
+    omega_table_path: str | Path | None = OMEGA_TABLE_PATH,
+) -> np.ndarray:
+    """
+    Build symmetric omega_nm matrix by lookup from precomputed table.
+    """
+    N = len(elements)
+    omega_nm = np.zeros((N, N), dtype=float)
+
+    for i in range(N):
+        for j in range(i + 1, N):
+            w = omega_pair_lookup(
+                elem1=elements[i],
+                elem2=elements[j],
+                T_celsius=T_celsius,
+                phase=phase,
+                z_bcc=z_bcc,
+                lsq_xmin=lsq_xmin,
+                lsq_xmax=lsq_xmax,
+                lsq_npts=lsq_npts,
+                omega_table_path=omega_table_path,
+            )
+            omega_nm[i, j] = w
+            omega_nm[j, i] = w
+
+    return omega_nm
+
+
+# ============================================================
+# SURFACE FUNCTIONAL: return G = γΩ in J/mol
+# ============================================================
+
+def gammaOmega_Jmol(
+    Y: np.ndarray,
+    x_bulk: np.ndarray,
+    gamma0_Jm2: np.ndarray,
+    omega_nm_Jmol: np.ndarray,
+    Omega_m2mol: float,
+    R: float,
+    T_K: float,
+    zl: int,
+    zv: int,
+) -> float:
+    N, L = Y.shape
+
+    term1 = float(Omega_m2mol) * float(np.dot(Y[:, 0], gamma0_Jm2))
+
+    ratio = np.clip(Y / x_bulk[:, None], 1e-15, None)
+    term2 = float(R) * float(T_K) * float(np.sum(Y * np.log(ratio)))
+
+    term3 = 0.0
+    for n in range(N):
+        for m in range(n + 1, N):
+            term3 += omega_nm_Jmol[n, m] * (x_bulk[n] * x_bulk[m] - x_bulk[n] * Y[m, 0] - x_bulk[m] * Y[n, 0])
+    term3 *= float(zv)
+
+    term4 = 0.0
+    for i in range(L - 1):
+        for n in range(N):
+            for m in range(n + 1, N):
+                term4 += omega_nm_Jmol[n, m] * (
+                    (Y[m, i] - x_bulk[m]) * (Y[n, i + 1] - x_bulk[n]) +
+                    (Y[n, i] - x_bulk[n]) * (Y[m, i + 1] - x_bulk[m])
+                )
+    term4 *= float(zv)
+
+    term5 = 0.0
+    for i in range(L):
+        for n in range(N):
+            for m in range(n + 1, N):
+                term5 += omega_nm_Jmol[n, m] * (Y[n, i] - x_bulk[n]) * (Y[m, i] - x_bulk[m])
+    term5 *= float(zl)
+
+    return float(term1 + term2 + term3 + term4 + term5)
+
+
+# ============================================================
+# MONTE CARLO
+# ============================================================
+
+def monte_carlo_multicomponent(
+    Y_init: np.ndarray,
+    x_bulk: np.ndarray,
+    gamma0_Jm2: np.ndarray,
+    omega_nm_Jmol: np.ndarray,
+    Omega_m2mol: float,
+    R: float,
+    T_K: float,
+    zl: int,
+    zv: int,
+    steps: int = MC_STEPS,
+    delta_max: float = DELTA_MAX,
+    seed: int = 0,
+) -> Tuple[np.ndarray, float, float]:
+    rng = np.random.default_rng(seed)
+
+    Y = Y_init.copy()
+    Ecur = gammaOmega_Jmol(Y, x_bulk, gamma0_Jm2, omega_nm_Jmol, Omega_m2mol, R, T_K, zl, zv)
+    best_Y = Y.copy()
+    best_E = float(Ecur)
+
+    N, L = Y.shape
+
+    layer_weights = np.exp(-np.linspace(0.0, 3.0, L))
+    layer_weights /= layer_weights.sum()
+
+    accepted = 0
+    for _ in range(int(steps)):
+        layer = int(rng.choice(L, p=layer_weights))
+        a, b = rng.choice(N, 2, replace=False)
+        d = float(rng.uniform(-delta_max, delta_max))
+
+        Ya_new = Y[a, layer] - d
+        Yb_new = Y[b, layer] + d
+
+        if (0.0 < Ya_new < 1.0) and (0.0 < Yb_new < 1.0):
+            Yt = Y.copy()
+            Yt[a, layer] = Ya_new
+            Yt[b, layer] = Yb_new
+
+            Et = gammaOmega_Jmol(Yt, x_bulk, gamma0_Jm2, omega_nm_Jmol, Omega_m2mol, R, T_K, zl, zv)
+            dE = float(Et - Ecur)
+
+            if (dE <= 0.0) or (rng.random() < np.exp(-dE / (float(R) * float(T_K)))):
+                Y = Yt
+                Ecur = float(Et)
+                accepted += 1
+                if Ecur < best_E:
+                    best_E = float(Ecur)
+                    best_Y = Y.copy()
+
+    acc_ratio = accepted / float(steps)
+    best_gamma = float(best_E / float(Omega_m2mol))  # J/m^2
+    return best_Y, best_gamma, float(acc_ratio)
+
+
+# ============================================================
+# POSTPROCESSING
+# ============================================================
+
+def adsorption_vector(Y: np.ndarray, x_bulk: np.ndarray) -> np.ndarray:
+    return np.sum(Y - x_bulk[:, None], axis=1)
+
+
+def mean_surface_composition_at(Y: np.ndarray) -> np.ndarray:
+    """
+    Arithmetic mean over the simulated layers.
+    Returns atomic fraction (0-1).
+    """
+    y_mean = np.mean(Y, axis=1)
+    s = float(np.sum(y_mean))
+    if s <= 0:
+        raise ValueError("Mean surface composition sum <= 0.")
+    return y_mean / s
+
+
+def profile_at_to_dict(Y: np.ndarray, elements: List[str]) -> Dict[str, Dict[str, float]]:
+    out = {}
+    for i, el in enumerate(elements):
+        out[el.upper()] = {}
+        for layer in range(Y.shape[1]):
+            out[el.upper()][f"L{layer+1}"] = _round_float(Y[i, layer])
+    return out
+
+
+def vector_to_dict(values: np.ndarray, elements: List[str]) -> Dict[str, float]:
+    return {el.upper(): _round_float(values[i]) for i, el in enumerate(elements)}
+
+
+def wt_dict_substitutional_and_solutes(wt_percent: np.ndarray, elements: List[str]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    substitutional = {el.upper(): _round_float(wt_percent[i]) for i, el in enumerate(elements)}
+    solutes = {k: v for k, v in substitutional.items() if k != "FE"}
+    return substitutional, solutes
+
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
+
+def evaluate_surface_composition(
+    composition_bulk_wt: Dict[str, float],
+    T_celsius: float,
+    phase_name: str = PHASE_NAME,
+    pressure_pa: float = P_PA,
+    hkl: Tuple[int, int, int] = HKL,
+    a_bcc_m: float = A_BCC_M,
+    l_layers: int = L_LAYERS,
+    mc_steps: int = MC_STEPS,
+    delta_max: float = DELTA_MAX,
+    seed_base: int = SEED_BASE,
+    z_bcc: int = Z_BCC,
+    lsq_xmin: float = LSQ_X_MIN,
+    lsq_xmax: float = LSQ_X_MAX,
+    lsq_npts: int = LSQ_NPTS,
+    surface_json_path: str | Path | None = SURFACES_JSON_PATH,
+    omega_table_path: str | Path | None = OMEGA_TABLE_PATH,
+) -> Dict[str, Any]:
+    """
+    Run surface segregation MC for one alloy.
+
+    Parameters
+    ----------
+    composition_bulk_wt : dict
+        Bulk composition in wt%.
+        Fe may be omitted; if omitted, Fe is computed by substitutional balance.
+        Interstitials are ignored.
+    T_celsius : float
+        Aging temperature in °C from the GA.
+
+    Returns
+    -------
+    dict
+        Structured result including:
+        - surface_valid
+        - surface_reason
+        - T_celsius, T_K
+        - gamma_Jm2
+        - acceptance_ratio
+        - bulk_composition_at
+        - bulk_composition_wt_substitutional
+        - surface_profile_at
+        - surface_mean_at
+        - surface_mean_wt_substitutional
+        - surface_mean_wt_solutes
+    """
+    try:
+        T_K = _to_kelvin(T_celsius)
+
+        surf_df = load_surface_energy_table(surface_json_path=surface_json_path)
+        _ = build_omega_lookup(omega_table_path=omega_table_path)
+
+        # 1) Build explicit Fe-based substitutional input in wt%
+        elements, wt_vec, comp_sub_wt = build_mc_input_from_bulk_wt(composition_bulk_wt)
+
+        # 2) Convert bulk wt% -> bulk atomic fraction
+        x_bulk = wt_to_at_fraction(wt_vec, elements, MASAS)
+
+        # 3) Surface energy vector
+        gamma0 = gamma0_vector_from_mp_ids(elements, surf_df, MATERIAL_IDS)
+
+        # 4) BCC geometry
+        Omega, zl, zv = bcc_plane_constants(hkl=hkl, a=a_bcc_m, search_N=30)
+
+        # 5) Interaction matrix from precomputed table
+        omega_nm = omega_matrix_for_elements_from_table(
+            elements=elements,
+            T_celsius=T_celsius,
+            phase=phase_name,
+            z_bcc=z_bcc,
+            lsq_xmin=lsq_xmin,
+            lsq_xmax=lsq_xmax,
+            lsq_npts=lsq_npts,
+            omega_table_path=omega_table_path,
+        )
+
+        # 6) Initial homogeneous state in atomic fraction
+        Y0 = np.tile(x_bulk[:, None], (1, l_layers))
+
+        # 7) Monte Carlo in atomic fraction
+        Y_best, gamma_best, acc = monte_carlo_multicomponent(
+            Y_init=Y0,
+            x_bulk=x_bulk,
+            gamma0_Jm2=gamma0,
+            omega_nm_Jmol=omega_nm,
+            Omega_m2mol=Omega,
+            R=R,
+            T_K=T_K,
+            zl=zl,
+            zv=zv,
+            steps=mc_steps,
+            delta_max=delta_max,
+            seed=int(seed_base),
+        )
+
+        # 8) Validation: each layer must sum to ~1
+        layer_sums = Y_best.sum(axis=0)
+        if not np.allclose(layer_sums, 1.0, atol=1e-12, rtol=0.0):
+            return {
+                "surface_valid": False,
+                "surface_reason": "layer_sum_not_unity",
+                "T_celsius": _round_float(T_celsius),
+                "T_K": _round_float(T_K),
+                "layer_sums": [_round_float(x) for x in layer_sums],
+            }
+
+        # 9) Effective surface composition = arithmetic mean across layers
+        y_surface_mean_at = mean_surface_composition_at(Y_best)
+
+        # 10) Convert mean surface composition to wt%
+        wt_surface_mean = at_fraction_to_wt_percent(y_surface_mean_at, elements, MASAS)
+        wt_surface_mean_substitutional, wt_surface_mean_solutes = wt_dict_substitutional_and_solutes(wt_surface_mean, elements)
+
+        return {
+            "surface_valid": True,
+            "surface_reason": None,
+
+            "T_celsius": _round_float(T_celsius),
+            "T_K": _round_float(T_K),
+
+            "phase": phase_name,
+            "pressure_pa": _round_float(pressure_pa),
+            "hkl": tuple(hkl),
+            "L_layers": int(l_layers),
+
+            "gamma_Jm2": _round_float(gamma_best),
+            "acceptance_ratio": _round_float(acc),
+
+            "bulk_composition_wt_substitutional": {k.upper(): _round_float(v) for k, v in comp_sub_wt.items()},
+            "bulk_composition_at": vector_to_dict(x_bulk, elements),
+
+            "surface_profile_at": profile_at_to_dict(Y_best, elements),
+            "surface_mean_at": vector_to_dict(y_surface_mean_at, elements),
+
+            "surface_mean_wt_substitutional": wt_surface_mean_substitutional,
+            "surface_mean_wt_solutes": wt_surface_mean_solutes,
+        }
+
+    except Exception as e:
+        return {
+            "surface_valid": False,
+            "surface_reason": f"{type(e).__name__}: {e}",
+            "T_celsius": _round_float(T_celsius),
+            "T_K": _round_float(_to_kelvin(T_celsius)),
+        }
+
+
+# ============================================================
+# OPTIONAL: compact helper for downstream pipeline use
+# ============================================================
+
+def get_surface_composition_wt(
+    composition_bulk_wt: Dict[str, float],
+    T_celsius: float,
+    surface_json_path: str | Path | None = SURFACES_JSON_PATH,
+    omega_table_path: str | Path | None = OMEGA_TABLE_PATH,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper returning only the key output needed by downstream modules.
+    Extra kwargs are forwarded to evaluate_surface_composition().
+    """
+    result = evaluate_surface_composition(
+        composition_bulk_wt=composition_bulk_wt,
+        T_celsius=T_celsius,
+        surface_json_path=surface_json_path,
+        omega_table_path=omega_table_path,
+        **kwargs,
+    )
+
+    if not result["surface_valid"]:
+        return result
+
+    return {
+        "surface_valid": True,
+        "surface_reason": None,
+        "surface_mean_wt_substitutional": result["surface_mean_wt_substitutional"],
+        "surface_mean_wt_solutes": result["surface_mean_wt_solutes"],
+        "gamma_Jm2": result["gamma_Jm2"],
+        "acceptance_ratio": result["acceptance_ratio"],
+    }

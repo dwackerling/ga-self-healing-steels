@@ -1,0 +1,20 @@
+{
+  "best_params_from_train80_cv": {
+    "n_estimators": 502,
+    "max_depth": 26,
+    "min_samples_split": 2,
+    "min_samples_leaf": 1,
+    "max_features": 0.5859283746684858,
+    "max_samples": 0.9766475075620996
+  },
+  "model_params_used_final_fit": {
+    "n_estimators": 600,
+    "max_depth": 26,
+    "min_samples_split": 2,
+    "min_samples_leaf": 1,
+    "max_features": 0.5859283746684858,
+    "max_samples": 0.9766475075620996,
+    "oob_score": false
+  },
+  "selection_metric": "mean CV RMSE on train80"
+}

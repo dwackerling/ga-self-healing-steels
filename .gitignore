@@ -1,0 +1,48 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated outputs and run caches
+outputs/
+**/__pycache__/
+**/.ipynb_checkpoints/
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+
+# Large run artefacts only
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.parquet
+
+# Thermo-Calc / proprietary databases
+*.tdb
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Keep ML models needed for reproducibility
+!data/ml_models/*.pkl
+!data/ml_models/*.pickle
+!data/ml_models/*.joblib

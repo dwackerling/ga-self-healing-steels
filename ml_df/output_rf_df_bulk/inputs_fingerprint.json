@@ -1,0 +1,35 @@
+{
+  "SEED": 42,
+  "TARGET": "DF_bulk",
+  "DATA_PATH": {
+    "path": "C:\\Users\\dwack\\Documents\\Python Scripts\\sh_ga\\ml_df\\woking_dataset.csv",
+    "exists": true,
+    "size": 2203240,
+    "mtime": 1772826447.749574,
+    "sha256_head": "0114e1ec782901d006c3e7d2bf218c91451928687503977ce388d987b343155d",
+    "bytes_hashed": 2000000
+  },
+  "FEATURE_COLS": [
+    "Mn",
+    "Si",
+    "Cr",
+    "Mo",
+    "Ni",
+    "Cu",
+    "Co",
+    "V",
+    "Nb",
+    "W",
+    "Al",
+    "Ti"
+  ],
+  "TEST_SIZE": 0.2,
+  "N_TRIALS": 240,
+  "versions": {
+    "numpy": "1.26.4",
+    "pandas": "2.2.3",
+    "sklearn": "1.5.2",
+    "optuna": "4.5.0",
+    "joblib": "1.4.2"
+  }
+}

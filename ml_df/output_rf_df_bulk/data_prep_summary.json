@@ -1,0 +1,25 @@
+{
+  "n_rows_original": 10371,
+  "n_rows_used": 10090,
+  "n_rows_dropped_target_nan": 281,
+  "has_id_column": true,
+  "feature_cols_used": [
+    "Mn",
+    "Si",
+    "Cr",
+    "Mo",
+    "Ni",
+    "Cu",
+    "Co",
+    "V",
+    "Nb",
+    "W",
+    "Al",
+    "Ti"
+  ],
+  "excluded_interstitials": [
+    "C",
+    "B",
+    "N"
+  ]
+}

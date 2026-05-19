@@ -1,0 +1,116 @@
+project:
+  output_dir: outputs/runs
+  cache_dir: outputs/cache
+
+thermo:
+  use_system_databases: true
+  thermo_database: TCFE11
+  mobility_database: MOBFE6
+  tdb_path: data/thermo/steel_database_fix.tdb
+  surface_json_path: data/thermo/surfaces.json
+  omega_table_path: data/thermo/omega_pairs_table.csv
+  pressure_pa: 101325
+
+ml:
+  bulk_model_path: data/ml_models/rf_model_bulk.joblib
+  surface_model_path: data/ml_models/rf_model_surf.joblib
+
+  thresholds:
+    bulk_positive_margin: 0.0
+    surf_nonpositive_margin: 0.0
+    compare_margin: 0.0
+    bulk_uncertainty_band: 0.10
+    surf_uncertainty_band: 0.14
+    compare_uncertainty_band: 0.17
+
+  domain_bounds:
+    Mn: [0.0, 3.0]
+    Si: [0.0, 1.5]
+    Cr: [8.0, 20.0]
+    W:  [0.0, 5.0]
+    Mo: [0.0, 6.0]
+    Ni: [0.0, 14.0]
+    Cu: [0.0, 4.0]
+    Nb: [0.0, 4.0]
+    W:  [0.0, 5.0]
+    Ti: [0.0, 4.0]
+
+ga:
+  mode: surface_enhanced
+  population_size: 5
+  n_generations: 2
+  crossover_prob: 0.75
+  mutation_prob: 0.25
+  elite_size: 2
+  random_seed: 1
+  penalty_fitness: 1000000000.0
+  t_eval_h: 100
+
+surface_mc:
+  mc_steps: 10000
+  delta_max: 0.02
+  seed_base: 0
+
+go_nogo:
+  use_placeholder: false
+
+  phases:
+    matrix_bcc: BCC_A2
+    matrix_fcc: FCC_A1
+    laves: C14_LAVES
+    liquid: LIQUID
+    m23c6: M23C6_D84
+    mx: FCC_A1#2
+
+  composition:
+    fe_min_wt: 60.0
+
+  t_sol:
+    liquid_max: 1.0e-6
+    matrix_total_min: 0.98
+    laves_max: 1.0e-4
+    m23c6_max: 1.0e-4
+    mx_max: 0.02
+
+  t_aging:
+    bcc_min: 0.80
+    fcc_matrix_max: 0.05
+    laves_min: 0.01
+    m23c6_max: 0.02
+    mx_max: 0.02
+
+  driving_force:
+    delta_normalized_df_min: 0.01
+    require_positive_surface_df: true
+    require_positive_bulk_df: true
+
+fitness:
+  objective: coarsened_laves_radius
+  t_eval_h: 100.0
+
+  gamma:
+    source: constant
+    gamma_J_m2: 0.28
+
+  initial_radius:
+    source: normalized_driving_force
+    driving_force_key: DF_surf_tc
+    fallback_r0_nm: 5.0
+
+  coarsening:
+    model: multicomponent_lsw
+    matrix_phase: BCC_A2
+    precipitate_phase: C14_LAVES
+    elements: [Mo, Nb, Ti, W]
+    require_all_diffusivities: false
+    min_matrix_mole_fraction: 1.0e-10
+    min_precipitate_mole_fraction: 1.0e-10
+    min_diffusivity_m2_s: 1.0e-30
+
+  molar_volume:
+    source: constant
+    Vm_laves_m3_mol: 7.5e-6
+
+  driving_force:
+    source: normalized_driving_force
+    use_normalized_driving_force_as_DGv: false

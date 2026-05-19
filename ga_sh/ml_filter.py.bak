@@ -1,0 +1,475 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# ML filter for the self-healing ferritic steel GA
+# ============================================================
+#
+# Purpose
+# -------
+# Fast pre-screen before running expensive calculations
+# (surface MC + Thermo-Calc).
+#
+# The filter predicts:
+#   - DF_bulk_ml
+#   - DF_surf_ml
+#
+# and classifies each candidate into one of:
+#   - accept
+#   - reject
+#   - uncertain_model
+#   - uncertain_domain
+#
+# Modes
+# -----
+# bulk_dominant:
+#   DF_bulk > 0
+#   DF_surf <= 0
+#
+# surface_enhanced:
+#   DF_bulk > 0
+#   DF_surf > DF_bulk
+#
+# Notes
+# -----
+# - Input composition must be in wt%.
+# - Binary encoding is NOT used here.
+# - Missing model features are filled with 0.
+# - W is set to 0 in this current AG version unless provided.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+
+MODEL_PATH_BULK = Path(
+    r"C:\Users\dwack\Documents\Python Scripts\sh_ga\ml_df\output_rf_df_bulk\rf_model_bulk.joblib"
+)
+
+MODEL_PATH_SURF = Path(
+    r"C:\Users\dwack\Documents\Python Scripts\sh_ga\ml_df\output_rf_df_seg\rf_model_surf.joblib"
+)
+
+FEATURE_COLS = [
+    "Mn",
+    "Si",
+    "Cr",
+    "Mo",
+    "Ni",
+    "Cu",
+    "Co",
+    "V",
+    "Nb",
+    "W",
+    "Al",
+    "Ti",
+]
+
+# Domain bounds: initial practical approximation.
+# Replace later with exact percentile-based bounds if needed.
+DOMAIN_BOUNDS = {
+    "Mn": (0.0, 3.0),
+    "Si": (0.0, 1.5),
+    "Cr": (8.0, 20.0),
+    "Mo": (0.0, 6.0),
+    "Ni": (0.0, 14.0),
+    "Cu": (0.0, 4.0),
+    "Nb": (0.0, 4.0),
+    "W":  (0.0, 5.0),
+    "Ti": (0.0, 4.0),
+    # Co, V, Al are fixed to 0 in the current GA version
+}
+
+VALID_MODES = {"bulk_dominant", "surface_enhanced"}
+
+
+# Margins for decision boundaries.
+DEFAULT_THRESHOLDS = {
+    # Physical boundaries
+    "bulk_positive_margin": 0.0,
+    "surf_nonpositive_margin": 0.0,
+    "compare_margin": 0.0,
+
+    # Uncertainty bands derived from RMSE on test20
+    "bulk_uncertainty_band": 0.10,
+    "surf_uncertainty_band": 0.14,
+    "compare_uncertainty_band": 0.17,
+}
+
+# ------------------------------------------------------------
+# Model cache
+# ------------------------------------------------------------
+
+_MODEL_BULK = None
+_MODEL_SURF = None
+
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+def _round_float(x: float, ndigits: int = 6) -> float:
+    return round(float(x), ndigits)
+
+
+def _validate_mode(mode: str) -> None:
+    if mode not in VALID_MODES:
+        raise ValueError(
+            f"Invalid mode: {mode!r}. Valid modes are: {sorted(VALID_MODES)}"
+        )
+
+
+def _validate_thresholds(thresholds: Dict[str, float]) -> None:
+    required = {
+        "bulk_positive_margin",
+        "surf_nonpositive_margin",
+        "compare_margin",
+        "bulk_uncertainty_band",
+        "surf_uncertainty_band",
+        "compare_uncertainty_band",
+    }
+    missing = required.difference(thresholds.keys())
+    if missing:
+        raise ValueError(f"Missing thresholds: {sorted(missing)}")
+
+
+def _safe_get(comp: Dict[str, Any], key: str, default: float = 0.0) -> float:
+    val = comp.get(key, default)
+    if val is None:
+        return float(default)
+    return float(val)
+
+
+# ------------------------------------------------------------
+# Model loading
+# ------------------------------------------------------------
+
+def load_models(
+    bulk_model_path: Path = MODEL_PATH_BULK,
+    surf_model_path: Path = MODEL_PATH_SURF,
+    force_reload: bool = False,
+):
+    """
+    Load global ML models and cache them in memory.
+    """
+    global _MODEL_BULK, _MODEL_SURF
+
+    if force_reload:
+        _MODEL_BULK = None
+        _MODEL_SURF = None
+
+    if _MODEL_BULK is None:
+        if not bulk_model_path.exists():
+            raise FileNotFoundError(f"Bulk model not found: {bulk_model_path}")
+        _MODEL_BULK = joblib.load(bulk_model_path)
+
+    if _MODEL_SURF is None:
+        if not surf_model_path.exists():
+            raise FileNotFoundError(f"Surface model not found: {surf_model_path}")
+        _MODEL_SURF = joblib.load(surf_model_path)
+
+    return _MODEL_BULK, _MODEL_SURF
+
+
+# ------------------------------------------------------------
+# Feature construction
+# ------------------------------------------------------------
+
+def build_feature_dict(composition_bulk: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Build the exact feature dictionary expected by the ML models.
+
+    Input composition is expected in wt%.
+    Missing features not used in the current GA are filled with 0.
+    """
+    feat = {
+        "Mn": _safe_get(composition_bulk, "Mn", 0.0),
+        "Si": _safe_get(composition_bulk, "Si", 0.0),
+        "Cr": _safe_get(composition_bulk, "Cr", 0.0),
+        "Mo": _safe_get(composition_bulk, "Mo", 0.0),
+        "Ni": _safe_get(composition_bulk, "Ni", 0.0),
+        "Cu": _safe_get(composition_bulk, "Cu", 0.0),
+        "Co": _safe_get(composition_bulk, "Co", 0.0),
+        "V":  _safe_get(composition_bulk, "V", 0.0),
+        "Nb": _safe_get(composition_bulk, "Nb", 0.0),
+        "W":  _safe_get(composition_bulk, "W", 0.0),
+        "Al": _safe_get(composition_bulk, "Al", 0.0),
+        "Ti": _safe_get(composition_bulk, "Ti", 0.0),
+    }
+
+    return {k: _round_float(v) for k, v in feat.items()}
+
+
+def build_feature_frame(composition_bulk: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Return a single-row DataFrame in the exact feature order expected by the models.
+    """
+    feat = build_feature_dict(composition_bulk)
+    return pd.DataFrame([[feat[c] for c in FEATURE_COLS]], columns=FEATURE_COLS)
+
+
+# ------------------------------------------------------------
+# Domain check
+# ------------------------------------------------------------
+
+def check_domain(
+    feature_dict: Dict[str, float],
+    domain_bounds: Dict[str, Tuple[float, float]] = DOMAIN_BOUNDS,
+) -> Dict[str, Any]:
+    """
+    Check whether the candidate lies inside the approximate model training domain.
+
+    Returns a structured result with:
+    - in_domain
+    - out_of_domain_features
+    """
+    out_of_domain = {}
+
+    for key, (lo, hi) in domain_bounds.items():
+        value = float(feature_dict.get(key, 0.0))
+        if value < lo or value > hi:
+            out_of_domain[key] = {
+                "value": _round_float(value),
+                "lo": _round_float(lo),
+                "hi": _round_float(hi),
+            }
+
+    return {
+        "in_domain": len(out_of_domain) == 0,
+        "out_of_domain_features": out_of_domain,
+    }
+
+
+# ------------------------------------------------------------
+# Prediction
+# ------------------------------------------------------------
+
+def predict_df_ml(
+    composition_bulk: Dict[str, Any],
+    bulk_model=None,
+    surf_model=None,
+) -> Dict[str, float]:
+    """
+    Predict DF_bulk_ml and DF_surf_ml from bulk composition in wt%.
+    """
+    if bulk_model is None or surf_model is None:
+        bulk_model, surf_model = load_models()
+
+    X = build_feature_frame(composition_bulk)
+
+    df_bulk_ml = float(bulk_model.predict(X)[0])
+    df_surf_ml = float(surf_model.predict(X)[0])
+
+    return {
+        "DF_bulk_ml": _round_float(df_bulk_ml),
+        "DF_surf_ml": _round_float(df_surf_ml),
+    }
+
+
+# ------------------------------------------------------------
+# Decision logic
+# ------------------------------------------------------------
+
+def classify_ml_result(
+    df_bulk_ml: float,
+    df_surf_ml: float,
+    mode: str,
+    thresholds: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    Classify the ML prediction into:
+    - accept
+    - reject
+    - uncertain_model
+
+    Rules:
+    bulk_dominant:
+        DF_bulk > 0
+        DF_surf <= 0
+
+    surface_enhanced:
+        DF_bulk > 0
+        DF_surf > DF_bulk
+    """
+    _validate_mode(mode)
+
+    th = dict(DEFAULT_THRESHOLDS if thresholds is None else thresholds)
+    _validate_thresholds(th)
+
+    bulk_pos = th["bulk_positive_margin"]
+    surf_nonpos = th["surf_nonpositive_margin"]
+    compare_margin = th["compare_margin"]
+
+    bulk_band = th["bulk_uncertainty_band"]
+    surf_band = th["surf_uncertainty_band"]
+    compare_band = th["compare_uncertainty_band"]
+
+    # 1) Common minimum condition: DF_bulk must be positive
+    if df_bulk_ml <= bulk_pos - bulk_band:
+        return {
+            "ml_status": "reject",
+            "reason": "bulk_not_stable",
+        }
+
+    if abs(df_bulk_ml - bulk_pos) <= bulk_band:
+        return {
+            "ml_status": "uncertain_model",
+            "reason": "bulk_near_zero",
+        }
+
+    # 2) Mode-specific logic
+    if mode == "bulk_dominant":
+        # Accept if surface is clearly non-positive
+        if df_surf_ml <= surf_nonpos - surf_band:
+            return {
+                "ml_status": "accept",
+                "reason": "bulk_dominant_confirmed",
+            }
+
+        # Uncertain if close to the surface threshold
+        if abs(df_surf_ml - surf_nonpos) <= surf_band:
+            return {
+                "ml_status": "uncertain_model",
+                "reason": "surface_near_zero",
+            }
+
+        # Otherwise surface is positive enough to reject the pure bulk mode
+        return {
+            "ml_status": "reject",
+            "reason": "surface_effect_present",
+        }
+
+    # mode == "surface_enhanced"
+    delta = df_surf_ml - df_bulk_ml
+
+    if delta > compare_margin + compare_band:
+        return {
+            "ml_status": "accept",
+            "reason": "surface_enhanced_confirmed",
+        }
+
+    if abs(delta - compare_margin) <= compare_band:
+        return {
+            "ml_status": "uncertain_model",
+            "reason": "surface_vs_bulk_near_boundary",
+        }
+
+    return {
+        "ml_status": "reject",
+        "reason": "surface_not_enhanced",
+    }
+
+
+# ------------------------------------------------------------
+# Main evaluation entry point
+# ------------------------------------------------------------
+
+def evaluate_ml_filter(
+    composition_bulk: Dict[str, Any],
+    mode: str,
+    thresholds: Optional[Dict[str, float]] = None,
+    bulk_model=None,
+    surf_model=None,
+    domain_bounds: Dict[str, Tuple[float, float]] = DOMAIN_BOUNDS,
+) -> Dict[str, Any]:
+    """
+    Main ML filter function.
+
+    Parameters
+    ----------
+    composition_bulk : dict
+        Bulk composition in wt%.
+    mode : str
+        "bulk_dominant" or "surface_enhanced"
+    thresholds : dict, optional
+        Decision thresholds and uncertainty bands.
+    bulk_model, surf_model : optional
+        Preloaded models to avoid reloading in loops.
+    domain_bounds : dict
+        Approximate training-domain bounds.
+
+    Returns
+    -------
+    dict
+        Structured result with:
+        - ml_status
+        - reason
+        - DF_bulk_ml
+        - DF_surf_ml
+        - in_domain
+        - out_of_domain_features
+        - feature_vector_ml
+    """
+    _validate_mode(mode)
+
+    feature_dict = build_feature_dict(composition_bulk)
+    domain_info = check_domain(feature_dict, domain_bounds=domain_bounds)
+
+    # If outside domain -> do not reject; send to physical confirmation
+    if not domain_info["in_domain"]:
+        preds = predict_df_ml(
+            composition_bulk=composition_bulk,
+            bulk_model=bulk_model,
+            surf_model=surf_model,
+        )
+        return {
+            "ml_status": "uncertain_domain",
+            "reason": "outside_training_domain",
+            "mode": mode,
+            "DF_bulk_ml": preds["DF_bulk_ml"],
+            "DF_surf_ml": preds["DF_surf_ml"],
+            "in_domain": False,
+            "out_of_domain_features": domain_info["out_of_domain_features"],
+            "feature_vector_ml": feature_dict,
+        }
+
+    preds = predict_df_ml(
+        composition_bulk=composition_bulk,
+        bulk_model=bulk_model,
+        surf_model=surf_model,
+    )
+
+    decision = classify_ml_result(
+        df_bulk_ml=preds["DF_bulk_ml"],
+        df_surf_ml=preds["DF_surf_ml"],
+        mode=mode,
+        thresholds=thresholds,
+    )
+
+    return {
+        "ml_status": decision["ml_status"],
+        "reason": decision["reason"],
+        "mode": mode,
+        "DF_bulk_ml": preds["DF_bulk_ml"],
+        "DF_surf_ml": preds["DF_surf_ml"],
+        "in_domain": True,
+        "out_of_domain_features": {},
+        "feature_vector_ml": feature_dict,
+    }
+
+
+# ------------------------------------------------------------
+# Convenience helper for GA loops
+# ------------------------------------------------------------
+
+def should_continue_after_ml(result: Dict[str, Any]) -> bool:
+    """
+    Returns True if the candidate should proceed to the next expensive stage.
+
+    Continue for:
+    - accept
+    - uncertain_model
+    - uncertain_domain
+
+    Stop only for:
+    - reject
+    """
+    return result.get("ml_status") != "reject"

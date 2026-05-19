@@ -1,0 +1,8 @@
+{
+  "n_total": 10090,
+  "n_train80": 8072,
+  "n_test20": 2018,
+  "test_size": 0.2,
+  "split_random_state": 42,
+  "split_type": "random_reproducible"
+}

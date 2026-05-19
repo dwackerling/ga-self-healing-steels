@@ -1,0 +1,66 @@
+{
+  "TARGET": "DF_bulk",
+  "features_used": [
+    "Mn",
+    "Si",
+    "Cr",
+    "Mo",
+    "Ni",
+    "Cu",
+    "Co",
+    "V",
+    "Nb",
+    "W",
+    "Al",
+    "Ti"
+  ],
+  "excluded_interstitials": [
+    "C",
+    "B",
+    "N"
+  ],
+  "n_total_used": 10090,
+  "n_train80": 8072,
+  "n_test20": 2018,
+  "metrics_train80": {
+    "RMSE": 0.046097643429646555,
+    "MAE": 0.016632000665987353,
+    "R2": 0.9858239344085215,
+    "NRMSE": 0.119055908669419,
+    "ME_bias": -0.0005509662432767418
+  },
+  "metrics_test20": {
+    "RMSE": 0.09825444114456434,
+    "MAE": 0.037316539896625096,
+    "R2": 0.9349000889159608,
+    "NRMSE": 0.253760732674437,
+    "ME_bias": -0.004112768522103852
+  },
+  "selection_metric": "mean CV RMSE on train80",
+  "model_file": "rf_model.joblib",
+  "artifacts": {
+    "clean_table": "modelling_table_clean.parquet",
+    "train80": "train80_with_ids.parquet",
+    "test20": "test20_with_ids.parquet",
+    "pred_train80": "pred_train80_with_ids.parquet",
+    "pred_test20": "pred_test20_with_ids.parquet",
+    "best_params": "best_params_train80.json",
+    "params_used": "model_params_used.json",
+    "metrics_train80": "metrics_train80.csv",
+    "metrics_test20": "metrics_test20.csv",
+    "feature_importance_gini": "feature_importance_gini.csv",
+    "permutation_importance_test20": "permutation_importance_test20.csv",
+    "cv_scores": "cv_train80_scores.csv",
+    "cv_summary": "cv_train80_summary.json",
+    "learning_curve_cv_csv": "learning_curve_cv_train80_rmse.csv",
+    "learning_curve_cv_png": "learning_curve_cv_train80_rmse.png",
+    "learning_curve_holdout_raw": "learning_curve_holdout_raw.csv",
+    "learning_curve_holdout_summary": "learning_curve_holdout_summary.csv",
+    "learning_curve_holdout_r2_png": "learning_curve_holdout_r2.png",
+    "learning_curve_holdout_rmse_png": "learning_curve_holdout_rmse.png",
+    "residuals_test20": "residuals_test20.parquet",
+    "resid_vs_yhat_test20_png": "resid_vs_yhat_test20.png",
+    "hist_residuals_test20_png": "hist_residuals_test20.png",
+    "oob_diagnostics": "oob_diagnostics.json"
+  }
+}
